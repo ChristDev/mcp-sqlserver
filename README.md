@@ -1,5 +1,7 @@
 # MCP SQL Server
 
+[Leer en Español](README.es.md)
+
 Token-efficient [MCP](https://modelcontextprotocol.io/) server for SQL Server. Designed to minimize context window usage while maximizing database exploration capabilities.
 
 **65% fewer tokens per turn** compared to generic database MCP servers, by using 1 tool + MCP Resources instead of multiple tools.
@@ -319,3 +321,7 @@ Inspired by the simplicity of [dbhub](https://github.com/bytebase/dbhub). Built 
 ## License
 
 MIT
+
+---
+
+If this saved you tokens (and headaches), star the repo!
