@@ -1,0 +1,51 @@
+# ============================================================================
+# MCP SQL Server — Configuration
+# ============================================================================
+# Copy this file to mcp-sqlserver.toml and update with your credentials.
+# DO NOT commit mcp-sqlserver.toml to git (it contains passwords).
+# ============================================================================
+
+# ============================================================================
+# SOURCES — Database connections
+# ============================================================================
+# Add one [[sources]] block per database. The first source is the default.
+
+[[sources]]
+id = "mydb"
+description = "My SQL Server Database"
+dsn = "Driver={ODBC Driver 18 for SQL Server};Server=localhost,1433;Database=MyDatabase;UID=sa;PWD=YourPassword;Encrypt=yes;TrustServerCertificate=yes"
+
+# Uncomment to add more databases:
+# [[sources]]
+# id = "staging"
+# description = "Staging Database"
+# dsn = "Driver={ODBC Driver 18 for SQL Server};Server=staging-db.example.com,1433;Database=StagingDB;UID=app_user;PWD=YourPassword;Encrypt=yes;TrustServerCertificate=yes"
+# lazy = true          # Connect only on first use
+
+# ============================================================================
+# GUARDRAILS — Per-source safety rules
+# ============================================================================
+# Each source can have its own guardrails. If not specified, defaults apply.
+
+[[guardrails]]
+source = "mydb"
+readonly = false         # Allow all SQL operations
+max_rows = 1000          # Auto-inject TOP N in SELECT queries
+query_timeout = 30       # Seconds before query is killed
+
+# Uncomment for read-only sources:
+# [[guardrails]]
+# source = "staging"
+# readonly = true        # Only SELECT, WITH, EXPLAIN allowed
+# max_rows = 500
+# query_timeout = 15
+
+# ============================================================================
+# SERVER — MCP server settings
+# ============================================================================
+
+[server]
+transport = "http"        # http (Docker/shared) or stdio (local MCP client)
+host = "0.0.0.0"          # Listen address (0.0.0.0 for Docker)
+port = 8002               # Listen port
+log_level = "INFO"        # DEBUG, INFO, WARNING, ERROR

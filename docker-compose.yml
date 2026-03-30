@@ -1,0 +1,11 @@
+services:
+  mcp-sqlserver:
+    build: .
+    network_mode: host          # Uses host network — includes VPN
+    environment:
+      - MCP_SQLSERVER_TRANSPORT_MODE=http
+      - MCP_SQLSERVER_HOST=0.0.0.0
+      - MCP_SQLSERVER_PORT=8002
+    volumes:
+      - ./mcp-sqlserver.toml:/app/mcp-sqlserver.toml:ro
+    restart: unless-stopped
