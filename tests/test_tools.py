@@ -3,7 +3,26 @@
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 
+from mcp_sqlserver.dbtypes import QueryResult, Row
 from mcp_sqlserver.tools import _format_result, _serialize_row
+
+
+def make_result(
+    columns: tuple[str, ...] = (),
+    rows: tuple[Row, ...] = (),
+    *,
+    elapsed_ms: int = 0,
+    truncated: bool = False,
+    message: str | None = None,
+) -> QueryResult:
+    return QueryResult(
+        columns=columns,
+        rows=rows,
+        row_count=len(rows) if columns else 0,
+        elapsed_ms=elapsed_ms,
+        truncated=truncated,
+        message=message,
+    )
 
 
 class TestSerializeRow:
@@ -55,12 +74,11 @@ class TestFormatResult:
     """Test query result formatting."""
 
     def test_select_with_rows(self):
-        result = {
-            "columns": ["id", "name"],
-            "rows": [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}],
-            "row_count": 2,
-            "execution_time_ms": 50,
-        }
+        result = make_result(
+            columns=("id", "name"),
+            rows=({"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}),
+            elapsed_ms=50,
+        )
         output = _format_result(result)
         assert '"Alice"' in output
         assert '"Bob"' in output
@@ -68,42 +86,26 @@ class TestFormatResult:
         assert "50ms" in output
 
     def test_select_empty(self):
-        result = {
-            "columns": ["id", "name"],
-            "rows": [],
-            "row_count": 0,
-            "execution_time_ms": 10,
-        }
+        result = make_result(columns=("id", "name"), elapsed_ms=10)
         output = _format_result(result)
         assert "0 rows returned" in output
 
     def test_insert_update_delete(self):
-        result = {
-            "columns": [],
-            "rows": [],
-            "row_count": 5,
-            "execution_time_ms": 20,
-            "message": "5 row(s) affected",
-        }
+        result = make_result(elapsed_ms=20, message="5 row(s) affected")
         output = _format_result(result)
         assert "5 row(s) affected" in output
 
-    def test_row_limit_indicator(self):
-        result = {
-            "columns": ["id"],
-            "rows": [{"id": i} for i in range(1000)],
-            "row_count": 1000,
-            "execution_time_ms": 100,
-        }
+    def test_truncation_is_reported(self):
+        result = make_result(
+            columns=("id",),
+            rows=tuple({"id": index} for index in range(1000)),
+            elapsed_ms=100,
+            truncated=True,
+        )
         output = _format_result(result)
-        assert "row limit applied" in output
+        assert "truncated" in output
 
-    def test_below_limit_no_indicator(self):
-        result = {
-            "columns": ["id"],
-            "rows": [{"id": 1}],
-            "row_count": 1,
-            "execution_time_ms": 5,
-        }
+    def test_complete_result_has_no_truncation_notice(self):
+        result = make_result(columns=("id",), rows=({"id": 1},), elapsed_ms=5)
         output = _format_result(result)
-        assert "row limit" not in output
+        assert "truncated" not in output

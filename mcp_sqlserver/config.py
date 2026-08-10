@@ -13,7 +13,26 @@ import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
+
+from mcp_sqlserver.errors import InvalidConfigError
+
+# ---------------------------------------------------------------------------
+# Concurrency defaults
+# ---------------------------------------------------------------------------
+
+#: Concurrent queries allowed per source when the server speaks HTTP to many
+#: clients. Each slot is one SQL Server session.
+HTTP_POOL_SIZE: Final = 4
+
+#: A stdio server has exactly one client, so one connection is enough.
+STDIO_POOL_SIZE: Final = 1
+
+#: Upper bound on any configured pool, so a typo cannot exhaust SQL Server.
+MAX_POOL_SIZE: Final = 16
+
+DEFAULT_POOL_TIMEOUT: Final = 5.0
+DEFAULT_CONNECT_TIMEOUT: Final = 10
 
 
 # ---------------------------------------------------------------------------
@@ -29,6 +48,9 @@ class SourceConfig:
     dsn: str
     description: str = ""
     lazy: bool = False
+    pool_size: int | None = None
+    pool_timeout: float = DEFAULT_POOL_TIMEOUT
+    connect_timeout: int = DEFAULT_CONNECT_TIMEOUT
 
 
 @dataclass
@@ -78,6 +100,12 @@ class AppConfig:
         """Return the first source as default."""
         return self.sources[0] if self.sources else None
 
+    def pool_size_for(self, source: SourceConfig) -> int:
+        """Concurrent queries allowed for a source, defaulted by transport."""
+        if source.pool_size is not None:
+            return source.pool_size
+        return STDIO_POOL_SIZE if self.server.transport == "stdio" else HTTP_POOL_SIZE
+
 
 # ---------------------------------------------------------------------------
 # TOML loading
@@ -90,24 +118,60 @@ def _load_toml(path: Path) -> dict[str, Any]:
         return tomllib.load(f)
 
 
+def _positive_int(name: str, value: Any, maximum: int | None = None) -> int:
+    """Parse a config value that must be a whole number of at least one."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise InvalidConfigError(field=name, value=repr(value), expected="an integer >= 1")
+    if maximum is not None and value > maximum:
+        raise InvalidConfigError(field=name, value=repr(value), expected=f"an integer <= {maximum}")
+    return value
+
+
+def _positive_float(name: str, value: Any) -> float:
+    """Parse a config value that must be a number greater than zero."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        raise InvalidConfigError(field=name, value=repr(value), expected="a number > 0")
+    return float(value)
+
+
+def _parse_source(raw: dict[str, Any]) -> SourceConfig:
+    """Build one typed source, rejecting values the pool cannot honour."""
+    source_id = str(raw["id"])
+    declared_pool_size = raw.get("pool_size")
+    pool_size = (
+        None
+        if declared_pool_size is None
+        else _positive_int(f"sources.{source_id}.pool_size", declared_pool_size, MAX_POOL_SIZE)
+    )
+    return SourceConfig(
+        id=source_id,
+        dsn=raw["dsn"],
+        description=raw.get("description", ""),
+        lazy=raw.get("lazy", False),
+        pool_size=pool_size,
+        pool_timeout=_positive_float(
+            f"sources.{source_id}.pool_timeout",
+            raw.get("pool_timeout", DEFAULT_POOL_TIMEOUT),
+        ),
+        connect_timeout=_positive_int(
+            f"sources.{source_id}.connect_timeout",
+            raw.get("connect_timeout", DEFAULT_CONNECT_TIMEOUT),
+        ),
+    )
+
+
 def _parse_toml(data: dict[str, Any]) -> AppConfig:
     """Parse raw TOML dict into typed AppConfig."""
-    sources = [
-        SourceConfig(
-            id=s["id"],
-            dsn=s["dsn"],
-            description=s.get("description", ""),
-            lazy=s.get("lazy", False),
-        )
-        for s in data.get("sources", [])
-    ]
+    sources = [_parse_source(s) for s in data.get("sources", [])]
 
     guardrails = [
         GuardrailConfig(
             source=g["source"],
             readonly=g.get("readonly", False),
             max_rows=g.get("max_rows", 1000),
-            query_timeout=g.get("query_timeout", 30),
+            query_timeout=_positive_int(
+                f"guardrails.{g['source']}.query_timeout", g.get("query_timeout", 30)
+            ),
         )
         for g in data.get("guardrails", [])
     ]
@@ -136,6 +200,8 @@ def _load_from_env() -> AppConfig:
     if not dsn:
         return AppConfig()
 
+    # Pool sizing is a TOML-only setting: env mode is the single-DSN quick start,
+    # where the transport default (see AppConfig.pool_size_for) is the right answer.
     sources = [SourceConfig(id="default", dsn=dsn, description="From environment")]
 
     readonly_str = os.environ.get("MCP_SQLSERVER_READONLY", "false")

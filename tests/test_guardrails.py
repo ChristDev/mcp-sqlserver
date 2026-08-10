@@ -3,6 +3,7 @@
 import pytest
 
 from mcp_sqlserver.config import GuardrailConfig
+from mcp_sqlserver.errors import ReadOnlyViolationError
 from mcp_sqlserver.guardrails import apply_row_limit, validate_readonly
 
 
@@ -50,18 +51,18 @@ class TestReadonlyValidation:
         ],
     )
     def test_readonly_blocks_writes(self, sql: str):
-        with pytest.raises(ValueError, match="Read-only mode"):
+        with pytest.raises(ReadOnlyViolationError, match="Read-only mode"):
             validate_readonly(sql, self._guardrail(readonly=True))
 
     def test_readonly_off_allows_everything(self):
         validate_readonly("DROP TABLE Users", self._guardrail(readonly=False))
 
     def test_readonly_empty_query_raises(self):
-        with pytest.raises(ValueError, match="Empty query"):
+        with pytest.raises(ReadOnlyViolationError, match="query is empty"):
             validate_readonly("", self._guardrail(readonly=True))
 
     def test_readonly_comment_only_query(self):
-        with pytest.raises(ValueError, match="Empty query"):
+        with pytest.raises(ReadOnlyViolationError, match="query is empty"):
             validate_readonly("-- just a comment", self._guardrail(readonly=True))
 
     def test_readonly_strips_comments_before_check(self):
@@ -70,8 +71,36 @@ class TestReadonlyValidation:
 
     def test_readonly_blocks_write_hidden_in_comment(self):
         sql = "/* SELECT */ INSERT INTO Users (Name) VALUES ('test')"
-        with pytest.raises(ValueError, match="Read-only mode"):
+        with pytest.raises(ReadOnlyViolationError, match="Read-only mode"):
             validate_readonly(sql, self._guardrail(readonly=True))
+
+    # Fail-closed: a read verb at the front is not enough on its own.
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "WITH x AS (SELECT Id FROM Users) DELETE FROM Users WHERE Id IN (SELECT Id FROM x)",
+            "with x as (select 1 as n) update Users set Name = 'x'",
+            "SELECT 1; DELETE FROM Users",
+            "SELECT 1;\nDROP TABLE Users",
+            "SELECT * INTO UsersBackup FROM Users",
+            "SET NOCOUNT ON; TRUNCATE TABLE Users",
+            "SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'SELECT 1')",
+        ],
+    )
+    def test_readonly_blocks_writes_smuggled_behind_a_read_verb(self, sql: str):
+        with pytest.raises(ReadOnlyViolationError, match="Read-only mode"):
+            validate_readonly(sql, self._guardrail(readonly=True))
+
+    def test_readonly_allows_write_words_inside_string_literals(self):
+        sql = "SELECT * FROM AuditLog WHERE Action = 'delete' AND Note = 'drop table'"
+        validate_readonly(sql, self._guardrail(readonly=True))  # Should not raise
+
+    def test_readonly_allows_a_trailing_semicolon(self):
+        validate_readonly("SELECT * FROM Users;", self._guardrail(readonly=True))
+
+    def test_readonly_still_allows_cte_reads(self):
+        sql = "WITH recent AS (SELECT TOP 10 * FROM Orders) SELECT * FROM recent"
+        validate_readonly(sql, self._guardrail(readonly=True))  # Should not raise
 
 
 # ---------------------------------------------------------------------------

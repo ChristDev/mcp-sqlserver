@@ -33,21 +33,22 @@ async def app_lifespan(server: FastMCP):
 
     conn_manager = ConnectionManager(config)
 
-    # Connect to all non-lazy sources + health check
-    logger.info("Connecting to %d database source(s)...", len(config.sources))
-    results = conn_manager.health_check()
+    # Size the worker pool, then probe every non-lazy source in parallel.
+    logger.info("Probing %d database source(s)...", len(config.sources))
+    statuses = await conn_manager.start()
 
-    ok_count = sum(1 for r in results if r["status"] == "ok")
-    fail_count = len(results) - ok_count
-    if fail_count > 0:
-        logger.warning("%d source(s) failed health check — check VPN and credentials", fail_count)
-    logger.info("%d/%d source(s) connected", ok_count, len(results))
+    ready = sum(1 for status in statuses if status.healthy)
+    if ready < len(statuses):
+        logger.warning(
+            "%d source(s) unavailable — serving the healthy ones; check VPN and credentials",
+            len(statuses) - ready,
+        )
+    logger.info("%d/%d source(s) ready", ready, len(statuses))
 
     try:
         yield {"conn_manager": conn_manager, "config": config}
     finally:
-        conn_manager.close_all()
-        logger.info("All database connections closed")
+        await conn_manager.aclose()
 
 
 def create_server(config: AppConfig) -> FastMCP:

@@ -15,7 +15,11 @@ import argparse
 import logging
 import sys
 
-from mcp_sqlserver.config import load_config
+import anyio
+
+from mcp_sqlserver import __version__
+from mcp_sqlserver.config import AppConfig, load_config
+from mcp_sqlserver.connection import ConnectionManager, HealthStatus
 
 
 def main() -> None:
@@ -82,13 +86,8 @@ def main() -> None:
 
     # Health check mode
     if args.health:
-        from mcp_sqlserver.connection import ConnectionManager
-
-        conn_manager = ConnectionManager(config)
-        results = conn_manager.health_check()
-        all_ok = all(r["status"] == "ok" for r in results)
-        conn_manager.close_all()
-        sys.exit(0 if all_ok else 1)
+        statuses = anyio.run(_probe_sources, config)
+        sys.exit(0 if all(status.healthy for status in statuses) else 1)
 
     # Banner
     _print_banner(config)
@@ -108,6 +107,15 @@ def main() -> None:
         )
 
 
+async def _probe_sources(config: AppConfig) -> tuple[HealthStatus, ...]:
+    """Run the startup health probe once and shut the pools down again."""
+    conn_manager = ConnectionManager(config)
+    try:
+        return await conn_manager.start()
+    finally:
+        await conn_manager.aclose()
+
+
 def _print_banner(config) -> None:
     """Print startup banner to stderr."""
     print(
@@ -117,7 +125,7 @@ def _print_banner(config) -> None:
         "| |\\/| | (__|  _/ \\__ \\ (_) | |__\\__ \\/ -_) '_\\ V / -_) '_|\n"
         "|_|  |_|\\___|_|   |___/\\__\\_\\____|___/\\___|_|  \\_/\\___|_|\n"
         "\n"
-        f"  v1.0.0 — Token-efficient MCP for SQL Server\n"
+        f"  v{__version__} — Token-efficient MCP for SQL Server\n"
         f"  Transport: {config.server.transport}\n"
         f"  Sources:   {len(config.sources)}\n",
         file=sys.stderr,

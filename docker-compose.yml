@@ -1,14 +1,16 @@
 services:
   mcp-sqlserver:
     build: .
+    container_name: mcp-sqlserver
     # network_mode: host — does NOT expose ports on Docker Desktop Windows.
     # Using port mapping instead. VPN routes work via Docker Desktop networking.
+    # Port lives in one place: export MCP_SQLSERVER_PORT to change it.
     ports:
-      - "8002:8002"
+      - "${MCP_SQLSERVER_PORT:-8002}:${MCP_SQLSERVER_PORT:-8002}"
     environment:
       - MCP_SQLSERVER_TRANSPORT_MODE=http
       - MCP_SQLSERVER_HOST=0.0.0.0
-      - MCP_SQLSERVER_PORT=8002
+      - MCP_SQLSERVER_PORT=${MCP_SQLSERVER_PORT:-8002}
     volumes:
       - ./mcp-sqlserver.toml:/app/mcp-sqlserver.toml:ro
     restart: unless-stopped

@@ -15,8 +15,12 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-# Install Python dependencies
+# Install Python dependencies.
+# __init__.py is copied first because pyproject.toml reads the version from it
+# (dynamic = ["version"]); without it, metadata generation fails. Keeping the
+# rest of the package for a later layer preserves dependency caching.
 COPY pyproject.toml ./
+COPY mcp_sqlserver/__init__.py ./mcp_sqlserver/__init__.py
 RUN pip install --no-cache-dir -e .
 
 # Copy application code

@@ -18,6 +18,7 @@ from fastmcp import Context, FastMCP
 from mcp_sqlserver.config import AppConfig
 from mcp_sqlserver.connection import ConnectionManager
 from mcp_sqlserver.guardrails import apply_row_limit, validate_readonly
+from mcp_sqlserver.dbtypes import QueryResult, Row
 
 logger = logging.getLogger(__name__)
 
@@ -37,54 +38,42 @@ def register_tools(mcp: FastMCP) -> None:
         config: AppConfig = ctx.lifespan_context["config"]
 
         # Resolve source
-        source_id = database or conn_manager._default_source_id
+        source_id = database or conn_manager.default_source_id
         guardrail = config.get_guardrail(source_id)
 
-        # Apply guardrails
+        # Apply guardrails — typed errors propagate to the MCP client as-is
         validate_readonly(query, guardrail)
         safe_query = apply_row_limit(query, guardrail)
 
-        # Execute
-        try:
-            result = await conn_manager.execute_query(safe_query, source_id)
-        except ValueError:
-            raise
-        except Exception as exc:
-            raise ValueError(f"Query execution failed: {exc}") from exc
+        result = await conn_manager.execute_query(safe_query, source_id=source_id)
 
         # Format response — compact JSON for token efficiency
         return _format_result(result)
 
 
-def _format_result(result: dict[str, Any]) -> str:
+def _format_result(result: QueryResult) -> str:
     """Format query result as compact, token-efficient text."""
-    rows = result.get("rows", [])
-    columns = result.get("columns", [])
-    row_count = result.get("row_count", 0)
-    elapsed = result.get("execution_time_ms", 0)
-    message = result.get("message", "")
-
     # Non-SELECT (INSERT/UPDATE/DELETE/DDL)
-    if not columns:
-        return message or f"{row_count} row(s) affected ({elapsed}ms)"
+    if not result.columns:
+        return result.message or f"{result.row_count} row(s) affected ({result.elapsed_ms}ms)"
 
     # Empty result set
-    if not rows:
-        return f"0 rows returned ({elapsed}ms)"
+    if not result.rows:
+        return f"0 rows returned ({result.elapsed_ms}ms)"
 
     # Format as JSON array — compact but readable
-    serializable_rows = [_serialize_row(row) for row in rows]
+    serializable_rows = [_serialize_row(row) for row in result.rows]
     output = json.dumps(serializable_rows, ensure_ascii=False, default=str)
 
     # Add metadata footer
-    footer = f"\n\n-- {row_count} row(s) ({elapsed}ms)"
-    if row_count >= 1000:
-        footer += " [row limit applied]"
+    footer = f"\n\n-- {result.row_count} row(s) ({result.elapsed_ms}ms)"
+    if result.truncated:
+        footer += " [truncated — raise max_rows for this source to see more]"
 
     return output + footer
 
 
-def _serialize_row(row: dict[str, Any]) -> dict[str, Any]:
+def _serialize_row(row: Row) -> dict[str, Any]:
     """Convert non-JSON-serializable types to strings."""
     result = {}
     for key, value in row.items():

@@ -8,31 +8,87 @@ from __future__ import annotations
 import re
 
 from mcp_sqlserver.config import GuardrailConfig
+from mcp_sqlserver.errors import ReadOnlyViolationError
 
-# SQL keywords allowed in read-only mode (SQL Server)
+# SQL keywords a read-only statement may start with (SQL Server)
 READONLY_KEYWORDS = frozenset(["select", "with", "explain", "showplan", "set"])
+
+# Verbs that mutate data, schema or server state. Checking only the first
+# keyword is not enough: `WITH x AS (...) DELETE FROM t` starts with WITH.
+WRITE_KEYWORDS = frozenset(
+    [
+        "insert",
+        "update",
+        "delete",
+        "merge",
+        "drop",
+        "alter",
+        "create",
+        "truncate",
+        "exec",
+        "execute",
+        "grant",
+        "revoke",
+        "deny",
+        "backup",
+        "restore",
+        "shutdown",
+        "reconfigure",
+        "openrowset",
+        "openquery",
+    ]
+)
+
+# Statements that start here may not smuggle a `SELECT ... INTO new_table`.
+_PROJECTION_KEYWORDS = frozenset(["select", "with"])
 
 
 def validate_readonly(sql: str, guardrail: GuardrailConfig) -> None:
     """Check if SQL is allowed under read-only mode.
 
+    Fails closed: the statement must begin with a read verb, contain no write
+    verb anywhere outside string literals, be a single statement, and not
+    materialise a new table with SELECT ... INTO.
+
     Raises:
-        ValueError: If query is not read-only and readonly mode is enabled.
+        ReadOnlyViolationError: If the source is read-only and the statement is not.
     """
     if not guardrail.readonly:
         return
 
-    stripped = _strip_comments(sql).strip().lower()
-    if not stripped:
-        raise ValueError("Empty query")
+    scrubbed = _strip_literals(_strip_comments(sql)).strip().lower()
+    if not scrubbed:
+        raise ReadOnlyViolationError(source_id=guardrail.source, reason="the query is empty")
 
-    first_keyword = stripped.split()[0] if stripped.split() else ""
+    words = _words(scrubbed)
+    first_keyword = words[0] if words else ""
 
     if first_keyword not in READONLY_KEYWORDS:
-        raise ValueError(
-            f"Read-only mode is enabled for source '{guardrail.source}'. "
-            f"Only these SQL operations are allowed: {', '.join(sorted(READONLY_KEYWORDS))}. "
-            f"Got: {first_keyword.upper()}"
+        raise ReadOnlyViolationError(
+            source_id=guardrail.source,
+            reason=(
+                f"only {', '.join(sorted(READONLY_KEYWORDS))} statements are allowed, "
+                f"got {first_keyword.upper()}"
+            ),
+        )
+
+    forbidden = sorted(WRITE_KEYWORDS.intersection(words))
+    if forbidden:
+        raise ReadOnlyViolationError(
+            source_id=guardrail.source,
+            reason=f"the statement contains write keywords: {', '.join(forbidden).upper()}",
+        )
+
+    if _has_multiple_statements(scrubbed):
+        raise ReadOnlyViolationError(
+            source_id=guardrail.source,
+            reason="only a single statement is allowed, and this one is batched with ';'",
+        )
+
+    if first_keyword in _PROJECTION_KEYWORDS and "into" in words:
+        raise ReadOnlyViolationError(
+            source_id=guardrail.source,
+            reason="SELECT ... INTO creates a table, which read-only mode forbids",
         )
 
 
@@ -114,3 +170,22 @@ def _strip_comments(sql: str) -> str:
     # Remove line comments
     result = re.sub(r"--[^\n]*", " ", result)
     return result
+
+
+def _strip_literals(sql: str) -> str:
+    """Blank out single-quoted strings so their contents are never scanned.
+
+    Without this, `WHERE action = 'delete'` would look like a write statement.
+    """
+    return re.sub(r"'(?:[^']|'')*'", " '' ", sql)
+
+
+def _words(scrubbed_sql: str) -> list[str]:
+    """Identifier-like words of a comment-free, literal-free statement."""
+    return re.findall(r"[a-z_][a-z0-9_]*", scrubbed_sql)
+
+
+def _has_multiple_statements(scrubbed_sql: str) -> bool:
+    """Whether anything follows a statement separator."""
+    head, separator, tail = scrubbed_sql.partition(";")
+    return bool(separator) and bool(tail.strip())

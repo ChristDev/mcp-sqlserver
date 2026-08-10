@@ -23,9 +23,10 @@ mcp-sqlserver uses **1 tool** (`execute_sql`) and moves schema exploration to **
 
 - **1 Tool + 11 Resources** — Minimal token overhead, maximum capability
 - **Multi-Database** — Connect to multiple SQL Server instances via TOML config
-- **Per-Source Guardrails** — Read-only mode, row limiting, query timeout per database
+- **Concurrent by design** — Bounded connection pool per source; many users and agents share one server safely
+- **Per-Source Guardrails** — Read-only mode, row limiting, real statement timeout per database
 - **Health Checks** — Validates network, auth, and query on startup with clear error messages
-- **Docker Ready** — `network_mode: host` for VPN/corporate network access
+- **Docker Ready** — Port mapping on 8002, reaches corporate/VPN databases through Docker Desktop networking
 - **Any MCP Client** — Works with Claude Desktop, Cursor, OpenCode, VS Code, Kiro, and any MCP-compatible client
 - **No npx** — Pre-built Docker image or pip install. No downloads at runtime.
 
@@ -197,6 +198,10 @@ id = "production"
 description = "Production Database"
 dsn = "Driver={ODBC Driver 18 for SQL Server};Server=prod-db.example.com,1433;Database=MyApp;UID=app_user;PWD=secret;Encrypt=yes;TrustServerCertificate=yes"
 
+pool_size = 4        # Concurrent queries (and SQL Server sessions) for this source
+pool_timeout = 5.0   # Seconds to wait for a free slot before answering "busy"
+connect_timeout = 10 # Seconds to wait for login
+
 [[sources]]
 id = "staging"
 description = "Staging Database"
@@ -242,7 +247,9 @@ MCP_SQLSERVER_QUERY_TIMEOUT=30
 
 ### Read-only mode
 
-Per-source. When enabled, only `SELECT`, `WITH`, `EXPLAIN`, `SHOWPLAN` are allowed.
+Per-source, and fail-closed. The statement must start with `SELECT`, `WITH`, `EXPLAIN`, `SHOWPLAN` or `SET`, **and** contain no write verb anywhere outside string literals, be a single statement, and not use `SELECT ... INTO`. So `WITH x AS (...) DELETE FROM t` and `SELECT 1; DROP TABLE t` are both rejected.
+
+Read-only mode is a guardrail against accidents, not a security boundary — enforce real restrictions with SQL Server permissions on the login.
 
 ### Row limiting
 
@@ -258,7 +265,27 @@ SELECT TOP 1000 * FROM Users WHERE Active = 1
 
 ### Query timeout
 
-Per-source timeout in seconds. Clear error message when exceeded.
+Per-source statement timeout in seconds, applied to the ODBC connection. When it fires, SQL Server cancels the statement, the caller gets a clear error, and the connection is discarded rather than returned to the pool.
+
+## Concurrency
+
+This server is built to be shared by many users and agents. Each source gets a **bounded connection pool**: one connection is leased to one complete query and returned afterwards, so two callers never touch the same pyodbc handle — which pyodbc (`threadsafety = 1`) does not permit.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `pool_size` | 4 over HTTP, 1 over stdio | Concurrent queries — and therefore SQL Server sessions — per source. Max 16. |
+| `pool_timeout` | 5.0 | Seconds a caller waits for a free slot before being told the source is busy |
+| `connect_timeout` | 10 | Seconds to wait for login |
+| `query_timeout` | 30 | Statement timeout (see above) |
+
+Admission happens before a worker thread is claimed, so a saturated source fails fast instead of queueing without limit:
+
+```
+Database 'production' is busy: 4 queries are already running and no slot became
+available within 5s. Retry shortly or raise pool_size for this source.
+```
+
+**Sizing**: `pool_size` × number of sources is the ceiling on sessions this server opens against SQL Server. Start at 4 per source and raise only if callers actually see busy errors.
 
 ## Health Check
 
@@ -286,9 +313,10 @@ AI Client (Claude Desktop / Cursor / VS Code / OpenCode)
     |  MCP Protocol (HTTP)
     v
 Docker Container (mcp-sqlserver)
-    |  network_mode: host (inherits VPN/corporate network)
+    |  port mapping 8002:8002 (reaches VPN/corporate network)
     |
     |  Python + fastmcp + pyodbc
+    |  one bounded connection pool per source
     |
     v
 SQL Server
@@ -311,7 +339,8 @@ SQL Server
 | Version | Features |
 |---------|----------|
 | **v1.0** | 1 tool + resources + prompts, multi-connection TOML, guardrails |
-| **v2.0** | SSH Tunneling, lazy connection pooling, connection retry |
+| **v1.1** | Bounded connection pool per source, real statement timeout, parameterised catalog queries, fail-closed read-only |
+| **v2.0** | SSH tunneling, per-user authentication and audit trail |
 | **v3.0** | Extensible connector interface (PostgreSQL, MySQL) |
 
 ## Acknowledgments

@@ -1,243 +1,253 @@
-"""Connection manager — pool per-source, health checks, async wrapper.
+"""Connection manager — one bounded pool per source, plus health reporting.
 
-Each source gets its own pyodbc connection. All blocking pyodbc calls are
-wrapped in asyncio thread executor to avoid blocking the FastMCP event loop.
+The manager owns a :class:`~mcp_sqlserver.pool.SourcePool` per configured
+source and routes every query to the right one. It never hands a connection to
+callers, so no two requests can share a pyodbc handle.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import socket
 import struct
-import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from functools import partial
-from typing import Any
+from enum import StrEnum
 
+import anyio
+import anyio.to_thread
 import pyodbc
 
-from mcp_sqlserver.config import AppConfig, GuardrailConfig, SourceConfig
+from mcp_sqlserver.config import AppConfig, SourceConfig
+from mcp_sqlserver.dbtypes import (
+    ConnectionFactory,
+    DbConnection,
+    PoolSpec,
+    QueryRequest,
+    QueryResult,
+    Row,
+    SqlParams,
+)
+from mcp_sqlserver.errors import DatabaseError, SourceUnavailableError, UnknownSourceError
+from mcp_sqlserver.pool import SourcePool
 
 logger = logging.getLogger(__name__)
 
+NETWORK_PROBE_TIMEOUT_SECONDS = 5.0
+DEFAULT_SQL_PORT = 1433
+DATETIMEOFFSET_ODBC_TYPE = -155
+AUTH_SQLSTATE_CLASS = "28"
+THREAD_HEADROOM = 4
+
+
+class HealthState(StrEnum):
+    """Outcome of probing one source."""
+
+    OK = "ok"
+    DEFERRED = "deferred"
+    NETWORK_ERROR = "network_error"
+    AUTH_ERROR = "auth_error"
+    QUERY_ERROR = "query_error"
+
+
+@dataclass(frozen=True, slots=True)
+class HealthStatus:
+    """What one source reported when probed."""
+
+    source_id: str
+    state: HealthState
+    message: str
+
+    @property
+    def healthy(self) -> bool:
+        """Whether this source can serve queries right now."""
+        return self.state in {HealthState.OK, HealthState.DEFERRED}
+
 
 class ConnectionManager:
-    """Manages pyodbc connections for all configured sources."""
+    """Routes queries to per-source pools and reports their health."""
 
     def __init__(self, config: AppConfig) -> None:
         self._config = config
-        self._connections: dict[str, pyodbc.Connection] = {}
+        self._pools = {
+            source.id: SourcePool(_spec_for(config, source), _factory_for(source))
+            for source in config.sources
+        }
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    @property
+    def default_source_id(self) -> str:
+        """Id of the source used when a caller does not name one."""
+        default = self._config.default_source
+        if default is None:
+            raise UnknownSourceError(source_id="", known_sources=())
+        return default.id
 
-    def connect_all(self) -> None:
-        """Connect to all non-lazy sources at startup."""
-        for source in self._config.sources:
-            if source.lazy:
-                logger.info("[%s] Lazy — will connect on first use", source.id)
-                continue
-            self._connect_source(source)
+    @property
+    def source_ids(self) -> tuple[str, ...]:
+        """Every configured source id, in declaration order."""
+        return tuple(self._pools)
 
-    def close_all(self) -> None:
-        """Close all open connections."""
-        for source_id, conn in self._connections.items():
-            try:
-                conn.close()
-                logger.info("[%s] Disconnected", source_id)
-            except Exception as exc:
-                logger.warning("[%s] Error closing connection: %s", source_id, exc)
-        self._connections.clear()
+    async def start(self) -> tuple[HealthStatus, ...]:
+        """Size the worker thread pool, then probe every non-lazy source."""
+        _widen_thread_limiter(sum(pool.spec.size for pool in self._pools.values()))
+        return await self.health_check()
 
-    def _connect_source(self, source: SourceConfig) -> pyodbc.Connection:
-        """Open a connection to a single source."""
-        guardrail = self._config.get_guardrail(source.id)
-        try:
-            conn = pyodbc.connect(source.dsn, autocommit=True, timeout=guardrail.query_timeout)
-            conn.add_output_converter(-155, _handle_datetimeoffset)
-            self._connections[source.id] = conn
-            logger.info("[%s] Connected — %s", source.id, source.description or source.dsn[:50])
-            return conn
-        except pyodbc.Error as exc:
-            logger.error("[%s] Connection failed: %s", source.id, exc)
-            raise
+    async def health_check(self) -> tuple[HealthStatus, ...]:
+        """Probe every source in parallel; one failure never blocks the others."""
+        collected: dict[str, HealthStatus] = {}
 
-    def _ensure_connected(self, source_id: str) -> pyodbc.Connection:
-        """Get or create connection for a source (handles lazy connect)."""
-        if source_id in self._connections:
-            conn = self._connections[source_id]
-            # Test connection health
-            try:
-                conn.execute("SELECT 1")
-                return conn
-            except Exception:
-                logger.warning("[%s] Connection lost — reconnecting", source_id)
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                del self._connections[source_id]
+        async def probe(source: SourceConfig) -> None:
+            collected[source.id] = await self._probe(source)
 
-        source = self._config.get_source(source_id)
-        if not source:
-            raise ValueError(f"Unknown database source: '{source_id}'")
-        return self._connect_source(source)
+        async with anyio.create_task_group() as tg:
+            for source in self._config.sources:
+                tg.start_soon(probe, source)
 
-    # ------------------------------------------------------------------
-    # Health checks
-    # ------------------------------------------------------------------
+        statuses = tuple(collected[source.id] for source in self._config.sources)
+        for status in statuses:
+            _log_status(status)
+        return statuses
 
-    def health_check(self) -> list[dict[str, Any]]:
-        """Run health check on all configured sources. Returns status per source."""
-        results = []
-        for source in self._config.sources:
-            result = self._check_source(source)
-            results.append(result)
-            status = result["status"]
-            msg = result["message"]
-            if status == "ok":
-                logger.info("[%s] OK — %s", source.id, msg)
-            else:
-                logger.error("[%s] %s — %s", source.id, status.upper(), msg)
-        return results
-
-    def _check_source(self, source: SourceConfig) -> dict[str, Any]:
-        """Check connectivity for a single source."""
-        result: dict[str, Any] = {"source": source.id, "database": source.description}
-
-        # Step 1: Network check
-        host, port = _extract_host_port(source.dsn)
-        if host:
-            try:
-                sock = socket.create_connection((host, port), timeout=5)
-                sock.close()
-            except (OSError, socket.timeout):
-                result["status"] = "network_error"
-                result["message"] = f"Cannot reach {host}:{port} — VPN connected?"
-                return result
-
-        # Step 2: Auth + query check
-        guardrail = self._config.get_guardrail(source.id)
-        try:
-            conn = pyodbc.connect(source.dsn, autocommit=True, timeout=guardrail.query_timeout)
-            conn.add_output_converter(-155, _handle_datetimeoffset)
-            cursor = conn.cursor()
-            cursor.execute("SELECT DB_NAME() AS db_name")
-            row = cursor.fetchone()
-            db_name = row[0] if row else "unknown"
-            cursor.close()
-            self._connections[source.id] = conn
-            result["status"] = "ok"
-            result["message"] = f"{db_name} ready"
-        except pyodbc.InterfaceError as exc:
-            result["status"] = "auth_error"
-            result["message"] = (
-                f"Authentication failed — check credentials in mcp-sqlserver.toml ({exc})"
-            )
-        except pyodbc.Error as exc:
-            result["status"] = "query_error"
-            result["message"] = f"Connected but query failed — check database permissions ({exc})"
-
-        return result
-
-    # ------------------------------------------------------------------
-    # Query execution (async wrappers)
-    # ------------------------------------------------------------------
+    async def aclose(self) -> None:
+        """Drain and close every pool."""
+        async with anyio.create_task_group() as tg:
+            for pool in self._pools.values():
+                tg.start_soon(pool.aclose)
+        logger.info("All database connections closed")
 
     async def execute_query(
         self,
         sql: str,
+        params: SqlParams = (),
+        *,
         source_id: str | None = None,
-    ) -> dict[str, Any]:
-        """Execute a SQL query and return results as dict.
-
-        Returns:
-            {
-                "columns": [...],
-                "rows": [{...}, ...],
-                "row_count": int,
-                "execution_time_ms": int
-            }
-        """
-        sid = source_id or self._default_source_id
-        return await self._run_sync(partial(self._execute_query_sync, sql, sid))
-
-    def _execute_query_sync(self, sql: str, source_id: str) -> dict[str, Any]:
-        """Synchronous query execution."""
-        conn = self._ensure_connected(source_id)
-        cursor = conn.cursor()
-        start = time.perf_counter()
-        try:
-            cursor.execute(sql)
-
-            # Check if there are results (SELECT, EXEC with result set)
-            if cursor.description:
-                columns = [col[0] for col in cursor.description]
-                rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
-                elapsed_ms = int((time.perf_counter() - start) * 1000)
-                return {
-                    "columns": columns,
-                    "rows": rows,
-                    "row_count": len(rows),
-                    "execution_time_ms": elapsed_ms,
-                }
-
-            # No result set (INSERT, UPDATE, DELETE, DDL)
-            affected = cursor.rowcount
-            elapsed_ms = int((time.perf_counter() - start) * 1000)
-            return {
-                "columns": [],
-                "rows": [],
-                "row_count": affected,
-                "execution_time_ms": elapsed_ms,
-                "message": f"{affected} row(s) affected",
-            }
-        except pyodbc.Error as exc:
-            elapsed_ms = int((time.perf_counter() - start) * 1000)
-            raise ValueError(
-                f"SQL Error [{exc.args[0] if exc.args else 'unknown'}]: "
-                f"{exc.args[1] if len(exc.args) > 1 else str(exc)}"
-            ) from exc
-        finally:
-            cursor.close()
+    ) -> QueryResult:
+        """Run one statement on the named source and return the full result."""
+        pool = self._pool_for(source_id)
+        return await pool.execute(QueryRequest(sql=sql, params=params))
 
     async def execute_query_raw(
         self,
         sql: str,
+        params: SqlParams = (),
+        *,
         source_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Execute query, return just the rows as list of dicts."""
-        result = await self.execute_query(sql, source_id)
-        return result.get("rows", [])
+    ) -> list[Row]:
+        """Run one statement and return just its rows."""
+        result = await self.execute_query(sql, params, source_id=source_id)
+        return list(result.rows)
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    def _pool_for(self, source_id: str | None) -> SourcePool:
+        resolved = source_id or self.default_source_id
+        pool = self._pools.get(resolved)
+        if pool is None:
+            raise UnknownSourceError(source_id=resolved, known_sources=self.source_ids)
+        return pool
 
-    @property
-    def _default_source_id(self) -> str:
-        """Get default source ID."""
-        default = self._config.default_source
-        if not default:
-            raise ValueError("No database sources configured")
-        return default.id
+    async def _probe(self, source: SourceConfig) -> HealthStatus:
+        if source.lazy:
+            return HealthStatus(
+                source_id=source.id,
+                state=HealthState.DEFERRED,
+                message="lazy — connects on first use",
+            )
 
-    @property
-    def source_ids(self) -> list[str]:
-        """List all configured source IDs."""
-        return [s.id for s in self._config.sources]
+        host, port = _extract_host_port(source.dsn)
+        if host is not None and not await _reachable(host, port):
+            return HealthStatus(
+                source_id=source.id,
+                state=HealthState.NETWORK_ERROR,
+                message=f"Cannot reach {host}:{port} — VPN connected?",
+            )
 
-    async def _run_sync(self, func: partial[Any]) -> Any:
-        """Run blocking pyodbc call in thread executor."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, func)
+        try:
+            result = await self._pools[source.id].execute(
+                QueryRequest(sql="SELECT DB_NAME() AS db_name")
+            )
+        except SourceUnavailableError as exc:
+            return HealthStatus(
+                source_id=source.id,
+                state=_state_for_sqlstate(exc.sqlstate),
+                message=str(exc),
+            )
+        except DatabaseError as exc:
+            return HealthStatus(
+                source_id=source.id,
+                state=HealthState.QUERY_ERROR,
+                message=str(exc),
+            )
+
+        database = str(result.rows[0]["db_name"]) if result.rows else source.id
+        return HealthStatus(
+            source_id=source.id,
+            state=HealthState.OK,
+            message=f"{database} ready",
+        )
 
 
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
+def _spec_for(config: AppConfig, source: SourceConfig) -> PoolSpec:
+    """Merge source and guardrail settings into the pool's contract."""
+    guardrail = config.get_guardrail(source.id)
+    return PoolSpec(
+        source_id=source.id,
+        size=config.pool_size_for(source),
+        admission_timeout=source.pool_timeout,
+        query_timeout=guardrail.query_timeout,
+        max_rows=guardrail.max_rows,
+    )
+
+
+def _factory_for(source: SourceConfig) -> ConnectionFactory:
+    """Build the callable a pool uses to open one connection to this source."""
+
+    def connect() -> DbConnection:
+        connection = pyodbc.connect(
+            source.dsn,
+            autocommit=True,
+            timeout=source.connect_timeout,
+        )
+        connection.add_output_converter(DATETIMEOFFSET_ODBC_TYPE, _handle_datetimeoffset)
+        return connection
+
+    return connect
+
+
+def _widen_thread_limiter(required: int) -> None:
+    """Ensure anyio can run every pooled query at once instead of queueing them."""
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    wanted = required + THREAD_HEADROOM
+    if limiter.total_tokens < wanted:
+        limiter.total_tokens = wanted
+
+
+async def _reachable(host: str, port: int) -> bool:
+    """Whether a TCP connection to the database host can be opened."""
+    return await anyio.to_thread.run_sync(_reachable_blocking, host, port)
+
+
+def _reachable_blocking(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=NETWORK_PROBE_TIMEOUT_SECONDS):
+            return True
+    except OSError:
+        return False
+
+
+def _state_for_sqlstate(sqlstate: str | None) -> HealthState:
+    """Tell a rejected login apart from an unreachable server."""
+    if sqlstate is not None and sqlstate.startswith(AUTH_SQLSTATE_CLASS):
+        return HealthState.AUTH_ERROR
+    return HealthState.NETWORK_ERROR
+
+
+def _log_status(status: HealthStatus) -> None:
+    if status.state is HealthState.OK:
+        logger.info("[%s] OK — %s", status.source_id, status.message)
+        return
+    if status.state is HealthState.DEFERRED:
+        logger.info("[%s] %s", status.source_id, status.message)
+        return
+    logger.error("[%s] %s — %s", status.source_id, status.state.upper(), status.message)
 
 
 def _handle_datetimeoffset(dto_value: bytes) -> datetime:
@@ -262,7 +272,6 @@ def _extract_host_port(dsn: str) -> tuple[str | None, int]:
       - ODBC: "...;Server=host,port;..."
       - URI:  "sqlserver://user:pass@host:port/db"
     """
-    # Try ODBC format: Server=host,port or Server=host
     dsn_lower = dsn.lower()
     for prefix in ("server=", "data source="):
         idx = dsn_lower.find(prefix)
@@ -274,14 +283,13 @@ def _extract_host_port(dsn: str) -> tuple[str | None, int]:
             if "," in server_part:
                 host, port_str = server_part.rsplit(",", 1)
                 return host.strip(), int(port_str.strip())
-            return server_part, 1433
+            return server_part, DEFAULT_SQL_PORT
 
-    # Try URI format: sqlserver://user:pass@host:port/db
     if "://" in dsn:
         from urllib.parse import urlparse
 
         parsed = urlparse(dsn)
         if parsed.hostname:
-            return parsed.hostname, parsed.port or 1433
+            return parsed.hostname, parsed.port or DEFAULT_SQL_PORT
 
-    return None, 1433
+    return None, DEFAULT_SQL_PORT
