@@ -13,8 +13,43 @@ from mcp_sqlserver.config import (
     SourceConfig,
     _load_toml,
     _parse_toml,
+    _resolve_toml_path,
     load_config,
 )
+
+
+class TestResolveTomlPath:
+    """A configured path is only accepted when it is really a file."""
+
+    def test_accepts_a_real_file(self, tmp_path: Path):
+        # Given: a TOML file on disk
+        config = tmp_path / "mcp-sqlserver.toml"
+        config.write_text("[server]\nport = 8002\n", encoding="utf-8")
+
+        # When/Then: it is accepted
+        assert _resolve_toml_path(str(config)) == config
+
+    def test_rejects_a_directory_left_by_a_broken_bind_mount(self, tmp_path: Path, capsys):
+        # Given: Docker created a directory because the host file was missing
+        mounted = tmp_path / "mcp-sqlserver.toml"
+        mounted.mkdir()
+
+        # When: the server resolves the configured path
+        resolved = _resolve_toml_path(str(mounted))
+
+        # Then: it declines instead of handing a directory to the TOML parser
+        assert resolved is None
+        assert "directory" in capsys.readouterr().err
+
+    def test_reports_a_missing_path(self, tmp_path: Path, capsys):
+        # Given: a path that does not exist at all
+        missing = tmp_path / "nope.toml"
+
+        # When/Then: the warning names it as not found, not as a directory
+        assert _resolve_toml_path(str(missing)) is None
+        error = capsys.readouterr().err
+        assert "not found" in error
+        assert "directory" not in error
 
 
 # ---------------------------------------------------------------------------

@@ -305,27 +305,45 @@ def _resolve_toml_path(cli_path: str | None) -> Path | None:
 
     # CLI arg
     if cli_path:
-        p = Path(cli_path)
-        if p.exists():
-            return p
-        _log_stderr(f"WARNING: Config file not found: {cli_path}")
-        return None
+        return _readable_toml(Path(cli_path), "--config")
 
     # Env var
     env_path = os.environ.get("MCP_SQLSERVER_CONFIG", "")
     if env_path:
-        p = Path(env_path)
-        if p.exists():
-            return p
-        _log_stderr(f"WARNING: Config file from MCP_SQLSERVER_CONFIG not found: {env_path}")
-        return None
+        return _readable_toml(Path(env_path), "MCP_SQLSERVER_CONFIG")
 
-    # Default location
+    # Default location — absent is normal here, the DSN paths may still apply
     default = Path("mcp-sqlserver.toml")
-    if default.exists():
+    if default.is_file():
         return default
-
+    _warn_when_directory(default, "./mcp-sqlserver.toml")
     return None
+
+
+def _readable_toml(path: Path, origin: str) -> Path | None:
+    """Accept a configured path only when it is really a file."""
+    if path.is_file():
+        return path
+    if not _warn_when_directory(path, origin):
+        _log_stderr(f"WARNING: Config file from {origin} not found: {path}")
+    return None
+
+
+def _warn_when_directory(path: Path, origin: str) -> bool:
+    """Report the Docker bind-mount trap, and say whether it applied.
+
+    Docker creates a DIRECTORY when the host side of a bind mount does not
+    exist. Handing that to the TOML parser raises a bare OSError, so name the
+    real problem instead.
+    """
+    if not path.is_dir():
+        return False
+    _log_stderr(
+        f"WARNING: {origin} points at a directory, not a file: {path}. "
+        "Docker creates one when a bind mount source is missing on the host — "
+        "check the path on the left side of the -v flag."
+    )
+    return True
 
 
 def _log_stderr(msg: str) -> None:
