@@ -1,110 +1,47 @@
-"""Application configuration — TOML + env vars + CLI merge.
+"""Configuration loading — TOML + env vars + CLI merge.
 
 Priority (highest first):
   1. CLI args
   2. Environment variables (MCP_SQLSERVER_*)
   3. TOML config file
   4. Defaults
+
+The typed model itself lives in :mod:`mcp_sqlserver.settings` and is re-exported
+here, so ``from mcp_sqlserver.config import AppConfig`` keeps working.
 """
 
 from __future__ import annotations
 
 import sys
 import tomllib
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final
+from typing import Any
 
 from mcp_sqlserver.errors import InvalidConfigError
+from mcp_sqlserver.settings import (
+    DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_POOL_TIMEOUT,
+    HTTP_POOL_SIZE,
+    MAX_POOL_SIZE,
+    STDIO_POOL_SIZE,
+    AppConfig,
+    GuardrailConfig,
+    ServerConfig,
+    SourceConfig,
+)
 
-# ---------------------------------------------------------------------------
-# Concurrency defaults
-# ---------------------------------------------------------------------------
-
-#: Concurrent queries allowed per source when the server speaks HTTP to many
-#: clients. Each slot is one SQL Server session.
-HTTP_POOL_SIZE: Final = 4
-
-#: A stdio server has exactly one client, so one connection is enough.
-STDIO_POOL_SIZE: Final = 1
-
-#: Upper bound on any configured pool, so a typo cannot exhaust SQL Server.
-MAX_POOL_SIZE: Final = 16
-
-DEFAULT_POOL_TIMEOUT: Final = 5.0
-DEFAULT_CONNECT_TIMEOUT: Final = 10
-
-
-# ---------------------------------------------------------------------------
-# Data classes for typed config
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class SourceConfig:
-    """A single database connection source."""
-
-    id: str
-    dsn: str
-    description: str = ""
-    lazy: bool = False
-    pool_size: int | None = None
-    pool_timeout: float = DEFAULT_POOL_TIMEOUT
-    connect_timeout: int = DEFAULT_CONNECT_TIMEOUT
-
-
-@dataclass
-class GuardrailConfig:
-    """Guardrails for a specific source."""
-
-    source: str
-    readonly: bool = False
-    max_rows: int = 1000
-    query_timeout: int = 30
-
-
-@dataclass
-class ServerConfig:
-    """MCP server settings."""
-
-    transport: str = "http"
-    host: str = "0.0.0.0"
-    port: int = 8002
-    log_level: str = "INFO"
-
-
-@dataclass
-class AppConfig:
-    """Root application configuration."""
-
-    sources: list[SourceConfig] = field(default_factory=list)
-    guardrails: list[GuardrailConfig] = field(default_factory=list)
-    server: ServerConfig = field(default_factory=ServerConfig)
-
-    def get_guardrail(self, source_id: str) -> GuardrailConfig:
-        """Get guardrail config for a source, or defaults."""
-        for g in self.guardrails:
-            if g.source == source_id:
-                return g
-        return GuardrailConfig(source=source_id)
-
-    def get_source(self, source_id: str) -> SourceConfig | None:
-        """Get source config by ID."""
-        for s in self.sources:
-            if s.id == source_id:
-                return s
-        return None
-
-    @property
-    def default_source(self) -> SourceConfig | None:
-        """Return the first source as default."""
-        return self.sources[0] if self.sources else None
-
-    def pool_size_for(self, source: SourceConfig) -> int:
-        """Concurrent queries allowed for a source, defaulted by transport."""
-        if source.pool_size is not None:
-            return source.pool_size
-        return STDIO_POOL_SIZE if self.server.transport == "stdio" else HTTP_POOL_SIZE
+__all__ = [
+    "DEFAULT_CONNECT_TIMEOUT",
+    "DEFAULT_POOL_TIMEOUT",
+    "HTTP_POOL_SIZE",
+    "MAX_POOL_SIZE",
+    "STDIO_POOL_SIZE",
+    "AppConfig",
+    "GuardrailConfig",
+    "ServerConfig",
+    "SourceConfig",
+    "load_config",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +130,11 @@ def _parse_toml(data: dict[str, Any]) -> AppConfig:
 
 
 def _load_from_env() -> AppConfig:
-    """Build config from environment variables (single-source mode)."""
+    """Build the single-source config from MCP_SQLSERVER_DSN, if it is set.
+
+    Server settings are NOT read here — see :func:`_apply_server_env`, which
+    applies them to whichever config won, TOML or DSN.
+    """
     import os
 
     dsn = os.environ.get("MCP_SQLSERVER_DSN", "")
@@ -210,18 +151,45 @@ def _load_from_env() -> AppConfig:
             source="default",
             readonly=readonly_str.lower() in ("true", "1", "yes"),
             max_rows=int(os.environ.get("MCP_SQLSERVER_MAX_ROWS", "1000")),
-            query_timeout=int(os.environ.get("MCP_SQLSERVER_QUERY_TIMEOUT", "30")),
+            query_timeout=_positive_int(
+                "MCP_SQLSERVER_QUERY_TIMEOUT",
+                int(os.environ.get("MCP_SQLSERVER_QUERY_TIMEOUT", "30")),
+            ),
         )
     ]
 
-    server = ServerConfig(
-        transport=os.environ.get("MCP_SQLSERVER_TRANSPORT_MODE", "http"),
-        host=os.environ.get("MCP_SQLSERVER_HOST", "0.0.0.0"),
-        port=int(os.environ.get("MCP_SQLSERVER_PORT", "8002")),
-        log_level=os.environ.get("MCP_SQLSERVER_LOG_LEVEL", "INFO"),
-    )
+    return AppConfig(sources=sources, guardrails=guardrails)
 
-    return AppConfig(sources=sources, guardrails=guardrails, server=server)
+
+def _apply_server_env(server: ServerConfig) -> None:
+    """Override the [server] block with whatever the environment actually sets.
+
+    Each variable is applied with ITS OWN value, and an absent variable leaves
+    the TOML untouched. The previous version rebuilt a whole ServerConfig from
+    hardcoded fallbacks and assigned that, so setting MCP_SQLSERVER_PORT
+    replaced the configured port with the code default instead of the value.
+    """
+    import os
+
+    transport = os.environ.get("MCP_SQLSERVER_TRANSPORT_MODE")
+    if transport:
+        server.transport = transport
+
+    host = os.environ.get("MCP_SQLSERVER_HOST")
+    if host:
+        server.host = host
+
+    port = os.environ.get("MCP_SQLSERVER_PORT")
+    if port:
+        if not port.isdigit():
+            raise InvalidConfigError(
+                field="MCP_SQLSERVER_PORT", value=repr(port), expected="an integer >= 1"
+            )
+        server.port = _positive_int("MCP_SQLSERVER_PORT", int(port))
+
+    log_level = os.environ.get("MCP_SQLSERVER_LOG_LEVEL")
+    if log_level:
+        server.log_level = log_level
 
 
 # ---------------------------------------------------------------------------
@@ -259,18 +227,7 @@ def load_config(
     if not config.sources and env_config.sources:
         config.sources = env_config.sources
         config.guardrails = env_config.guardrails
-    if env_config.server.transport != "http" or config.server.transport == "http":
-        # Env overrides server settings if explicitly set
-        import os
-
-        if os.environ.get("MCP_SQLSERVER_TRANSPORT_MODE"):
-            config.server.transport = env_config.server.transport
-        if os.environ.get("MCP_SQLSERVER_HOST"):
-            config.server.host = env_config.server.host
-        if os.environ.get("MCP_SQLSERVER_PORT"):
-            config.server.port = env_config.server.port
-        if os.environ.get("MCP_SQLSERVER_LOG_LEVEL"):
-            config.server.log_level = env_config.server.log_level
+    _apply_server_env(config.server)
 
     # Layer 3: CLI args (highest priority)
     if dsn:

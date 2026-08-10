@@ -16,6 +16,66 @@ from mcp_sqlserver.config import (
     _resolve_toml_path,
     load_config,
 )
+from mcp_sqlserver.errors import InvalidConfigError
+
+
+class TestServerEnvOverrides:
+    """Env vars override the [server] block with THEIR value, not a default.
+
+    Regression: the merge used to rebuild a ServerConfig from hardcoded
+    fallbacks, so setting MCP_SQLSERVER_PORT replaced the configured port with
+    the code default (8002) instead of the value asked for.
+    """
+
+    # port 1433 on purpose: it must differ from the 8002 code default, or the
+    # assertions would pass whether or not the override was honoured.
+    TOML = (
+        '[[sources]]\nid = "x"\n'
+        'dsn = "Driver={ODBC Driver 18 for SQL Server};Server=h,1433;Database=D;UID=u;PWD=p"\n\n'
+        '[server]\ntransport = "http"\nhost = "0.0.0.0"\nport = 1433\nlog_level = "INFO"\n'
+    )
+
+    @pytest.fixture
+    def configured(self, tmp_path: Path, monkeypatch):
+        (tmp_path / "mcp-sqlserver.toml").write_text(self.TOML, encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        for var in (
+            "MCP_SQLSERVER_PORT",
+            "MCP_SQLSERVER_HOST",
+            "MCP_SQLSERVER_TRANSPORT_MODE",
+            "MCP_SQLSERVER_LOG_LEVEL",
+            "MCP_SQLSERVER_DSN",
+            "MCP_SQLSERVER_CONFIG",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        return tmp_path
+
+    def test_absent_env_leaves_the_toml_alone(self, configured):
+        assert load_config().server.port == 1433
+
+    def test_env_port_applies_its_own_value(self, configured, monkeypatch):
+        monkeypatch.setenv("MCP_SQLSERVER_PORT", "9999")
+        assert load_config().server.port == 9999
+
+    def test_env_port_matching_the_toml_is_not_reset_to_the_code_default(
+        self, configured, monkeypatch
+    ):
+        # This is the exact deployment case: the image sets the same port the
+        # TOML declares. It used to come back as 8002.
+        monkeypatch.setenv("MCP_SQLSERVER_PORT", "1433")
+        assert load_config().server.port == 1433
+
+    def test_host_and_transport_apply_their_own_values(self, configured, monkeypatch):
+        monkeypatch.setenv("MCP_SQLSERVER_HOST", "127.0.0.1")
+        monkeypatch.setenv("MCP_SQLSERVER_TRANSPORT_MODE", "stdio")
+        config = load_config()
+        assert config.server.host == "127.0.0.1"
+        assert config.server.transport == "stdio"
+
+    def test_a_non_numeric_port_is_rejected(self, configured, monkeypatch):
+        monkeypatch.setenv("MCP_SQLSERVER_PORT", "not-a-port")
+        with pytest.raises(InvalidConfigError):
+            load_config()
 
 
 class TestResolveTomlPath:
