@@ -225,14 +225,26 @@ port = 8002
 log_level = "INFO"
 ```
 
-### Variables de entorno (base de datos única)
+### Variables de entorno (overrides — no hay `.env`)
+
+El TOML de arriba es toda la configuración. El server nunca lee un archivo `.env`. Las variables de entorno existen para que un contenedor pueda sobrescribir los settings del server sin rebuildear la imagen, y para apuntar a una sola base sin ningún archivo.
 
 ```bash
+# Dónde vive el TOML, y cómo escucha el server
+MCP_SQLSERVER_CONFIG=/app/mcp-sqlserver.toml
+MCP_SQLSERVER_TRANSPORT_MODE=http
+MCP_SQLSERVER_HOST=0.0.0.0
+MCP_SQLSERVER_PORT=8002
+MCP_SQLSERVER_LOG_LEVEL=INFO
+
+# Modo base única, sin TOML
 MCP_SQLSERVER_DSN="Driver={ODBC Driver 18 for SQL Server};Server=localhost;Database=mydb;UID=sa;PWD=pass"
 MCP_SQLSERVER_READONLY=false
 MCP_SQLSERVER_MAX_ROWS=1000
 MCP_SQLSERVER_QUERY_TIMEOUT=30
 ```
+
+**Los settings de pool son solo por TOML.** `pool_size`, `pool_timeout` y `connect_timeout` son por fuente y no tienen equivalente en variables de entorno — el camino por env es el arranque rápido de base única, donde el default del transporte ya es la respuesta correcta.
 
 ### Prioridad de config
 
@@ -268,6 +280,8 @@ Timeout de statement por fuente, en segundos, aplicado sobre la conexión ODBC. 
 ## Concurrencia
 
 Este server está pensado para ser compartido por varios usuarios y agentes. Cada fuente tiene un **pool de conexiones acotado**: se presta una conexión a una query completa y se devuelve al terminar, de modo que dos llamadores nunca tocan el mismo handle de pyodbc — algo que pyodbc (`threadsafety = 1`) no permite.
+
+Se ajusta por bloque `[[sources]]` en `mcp-sqlserver.toml` — no hay otro lugar:
 
 | Setting | Default | Significado |
 |---|---|---|

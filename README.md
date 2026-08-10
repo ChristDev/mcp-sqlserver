@@ -227,14 +227,26 @@ port = 8002
 log_level = "INFO"
 ```
 
-### Environment variables (single database)
+### Environment variables (overrides — there is no `.env`)
+
+The TOML above is the whole configuration. The server never reads a `.env` file. Environment variables exist so a container can override server settings without rebuilding the image, and so a single database can be pointed at with no file at all.
 
 ```bash
+# Where the TOML lives, and how the server listens
+MCP_SQLSERVER_CONFIG=/app/mcp-sqlserver.toml
+MCP_SQLSERVER_TRANSPORT_MODE=http
+MCP_SQLSERVER_HOST=0.0.0.0
+MCP_SQLSERVER_PORT=8002
+MCP_SQLSERVER_LOG_LEVEL=INFO
+
+# Single-database mode, no TOML at all
 MCP_SQLSERVER_DSN="Driver={ODBC Driver 18 for SQL Server};Server=localhost;Database=mydb;UID=sa;PWD=pass"
 MCP_SQLSERVER_READONLY=false
 MCP_SQLSERVER_MAX_ROWS=1000
 MCP_SQLSERVER_QUERY_TIMEOUT=30
 ```
+
+**Pool settings are TOML-only.** `pool_size`, `pool_timeout` and `connect_timeout` are per-source and have no environment equivalent — the env path is the single-database quick start, where the transport default is already the right answer.
 
 ### Config priority
 
@@ -270,6 +282,8 @@ Per-source statement timeout in seconds, applied to the ODBC connection. When it
 ## Concurrency
 
 This server is built to be shared by many users and agents. Each source gets a **bounded connection pool**: one connection is leased to one complete query and returned afterwards, so two callers never touch the same pyodbc handle — which pyodbc (`threadsafety = 1`) does not permit.
+
+You tune it per `[[sources]]` block in `mcp-sqlserver.toml` — there is no other place:
 
 | Setting | Default | Meaning |
 |---|---|---|

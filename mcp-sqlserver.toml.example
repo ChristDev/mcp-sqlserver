@@ -3,49 +3,64 @@
 # ============================================================================
 # Copy this file to mcp-sqlserver.toml and update with your credentials.
 # DO NOT commit mcp-sqlserver.toml to git (it contains passwords).
+#
+# This file is the ONLY configuration the server needs. There is no .env:
+# sources, guardrails, concurrency and server settings all live here.
+#
+# Add one [[sources]] block per database, and one [[guardrails]] block per
+# source. Below is a single complete example with every option spelled out.
 # ============================================================================
 
 # ============================================================================
-# SOURCES — Database connections
+# SOURCE — one database connection
 # ============================================================================
-# Add one [[sources]] block per database. The first source is the default.
+# The first source is the default one, used when a caller does not name a
+# database in execute_sql.
 
 [[sources]]
-id = "mydb"
+id = "mydb"                      # Name callers pass as the `database` argument
 description = "My SQL Server Database"
 dsn = "Driver={ODBC Driver 18 for SQL Server};Server=localhost,1433;Database=MyDatabase;UID=sa;PWD=YourPassword;Encrypt=yes;TrustServerCertificate=yes"
+lazy = false                     # true = connect on first use instead of at
+                                 # startup. Default: false
 
-# Uncomment to add more databases:
-# [[sources]]
-# id = "staging"
-# description = "Staging Database"
-# dsn = "Driver={ODBC Driver 18 for SQL Server};Server=staging-db.example.com,1433;Database=StagingDB;UID=app_user;PWD=YourPassword;Encrypt=yes;TrustServerCertificate=yes"
-# lazy = true          # Connect only on first use
+# --- Concurrency (this is where you tune it) --------------------------------
+# The server leases one connection per running query, so these settings decide
+# how many callers this source serves at once and how long they wait.
+pool_size = 4                    # Concurrent queries = SQL Server sessions for
+                                 # this source. Default: 4 over http, 1 over
+                                 # stdio. Maximum: 16
+pool_timeout = 5.0               # Seconds a caller waits for a free slot before
+                                 # the server answers "busy". Default: 5.0
+connect_timeout = 10             # Seconds to wait for the LOGIN handshake.
+                                 # Default: 10. Not the statement timeout —
+                                 # that is query_timeout, below
 
 # ============================================================================
-# GUARDRAILS — Per-source safety rules
+# GUARDRAILS — safety rules for that source
 # ============================================================================
-# Each source can have its own guardrails. If not specified, defaults apply.
+# One block per source. Omit it and the defaults below apply.
 
 [[guardrails]]
-source = "mydb"
-readonly = false         # Allow all SQL operations
-max_rows = 1000          # Auto-inject TOP N in SELECT queries
-query_timeout = 30       # Seconds before query is killed
-
-# Uncomment for read-only sources:
-# [[guardrails]]
-# source = "staging"
-# readonly = true        # Only SELECT, WITH, EXPLAIN allowed
-# max_rows = 500
-# query_timeout = 15
+source = "mydb"                  # Must match a [[sources]] id
+readonly = false                 # true = reject anything that writes. Fails
+                                 # closed: also rejects batched statements,
+                                 # SELECT ... INTO, and write verbs hidden in a
+                                 # CTE. Default: false
+max_rows = 1000                  # Cap on rows returned: TOP N is injected into
+                                 # SELECT and the fetch is capped regardless.
+                                 # Default: 1000
+query_timeout = 30               # STATEMENT timeout. SQL Server cancels the
+                                 # query after this many seconds and the
+                                 # connection is discarded. Default: 30
 
 # ============================================================================
 # SERVER — MCP server settings
 # ============================================================================
 
 [server]
-transport = "http"        # http (Docker/shared) or stdio (local MCP client)
-host = "0.0.0.0"          # Listen address (0.0.0.0 for Docker)
-port = 8002               # Listen port
-log_level = "INFO"        # DEBUG, INFO, WARNING, ERROR
+transport = "http"               # http (Docker/shared) or stdio (local client)
+host = "0.0.0.0"                 # Listen address (0.0.0.0 for Docker)
+port = 8002                      # Listen port for the MCP endpoint, NOT the
+                                 # SQL Server port (that one lives in the dsn)
+log_level = "INFO"               # DEBUG, INFO, WARNING, ERROR
