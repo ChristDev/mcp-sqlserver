@@ -101,6 +101,7 @@ def apply_row_limit(sql: str, guardrail: GuardrailConfig) -> str:
         SELECT * FROM t  →  SELECT TOP 1000 * FROM t
         SELECT DISTINCT name FROM t  →  SELECT DISTINCT TOP 1000 name FROM t
         SELECT TOP 10 * FROM t  →  SELECT TOP 10 * FROM t  (unchanged, user limit is lower)
+        SELECT * FROM t ORDER BY c OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY  (unchanged)
     """
     if guardrail.max_rows <= 0:
         return sql
@@ -110,6 +111,11 @@ def apply_row_limit(sql: str, guardrail: GuardrailConfig) -> str:
 
     # Only apply to SELECT statements
     if not stripped_lower.startswith(("select ", "select\t", "select\n")):
+        return sql
+
+    # A paginated statement already carries its own limit, and SQL Server
+    # refuses to see TOP next to OFFSET at all.
+    if _paginates(stripped_lower):
         return sql
 
     # Check if TOP already exists
@@ -138,6 +144,23 @@ _SELECT_PATTERN = re.compile(
     r"(SELECT\s+(?:DISTINCT\s+|ALL\s+)?)",
     re.IGNORECASE,
 )
+
+# `OFFSET n ROWS [FETCH NEXT m ROWS ONLY]` is SQL Server's own row limit, and
+# the engine rejects any query carrying both it and TOP: "A TOP can not be used
+# in the same query or sub-query as a OFFSET" (Msg 10741). Injecting TOP turned
+# a correct statement into invalid SQL, so callers had to rewrite valid
+# pagination by hand.
+#
+# The match is deliberately loose. A false positive only skips the injection,
+# and the pool still caps the fetch at max_rows, so the row limit holds either
+# way. A false negative produces SQL the engine refuses. The asymmetry decides
+# the trade-off.
+_OFFSET_FETCH_PATTERN = re.compile(r"\boffset\b.+?\brows?\b", re.IGNORECASE | re.DOTALL)
+
+
+def _paginates(scrubbed_sql: str) -> bool:
+    """Whether the statement already limits its rows with OFFSET."""
+    return bool(_OFFSET_FETCH_PATTERN.search(_strip_literals(scrubbed_sql)))
 
 
 def _extract_existing_top(sql_lower: str) -> int | None:

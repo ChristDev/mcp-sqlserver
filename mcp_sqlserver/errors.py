@@ -3,6 +3,16 @@
 Every failure this server can surface to an MCP client is one of these types.
 Callers match on the type instead of parsing message strings, and the message
 that reaches the user is written for the user, not for a stack trace.
+
+These dataclasses are deliberately NOT ``frozen``. An exception is mutated by
+the interpreter itself — ``exc.__traceback__ = tb`` as it propagates,
+``add_note()`` when a library annotates it — and a frozen dataclass generates a
+``__setattr__`` that refuses every assignment, including those. Combined with
+``slots=True`` the decorator also returns a NEW class object while that
+``__setattr__`` still closes over the original, so the refusal surfaces as
+``TypeError: super(type, obj): obj must be an instance or subtype of type``.
+The real error is destroyed and replaced by that, for every type below. Do not
+add ``frozen=True`` here; ``slots=True`` alone is safe and is what these use.
 """
 
 from __future__ import annotations
@@ -14,7 +24,7 @@ class DatabaseError(Exception):
     """Base for every database access failure."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class InvalidConfigError(Exception):
     """A configured value is outside the range the server can honour."""
 
@@ -26,7 +36,7 @@ class InvalidConfigError(Exception):
         return f"Invalid config: {self.field}={self.value} — expected {self.expected}"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class UnknownSourceError(DatabaseError):
     """A query named a source id that is not configured."""
 
@@ -38,7 +48,7 @@ class UnknownSourceError(DatabaseError):
         return f"Unknown database source {self.source_id!r}. Configured sources: {known}"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class PoolExhaustedError(DatabaseError):
     """Every connection slot for the source was busy for longer than the admission wait."""
 
@@ -54,7 +64,7 @@ class PoolExhaustedError(DatabaseError):
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class SourceUnavailableError(DatabaseError):
     """The source could not be reached or authenticated."""
 
@@ -66,7 +76,7 @@ class SourceUnavailableError(DatabaseError):
         return f"Cannot connect to database {self.source_id!r}: {self.detail}"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class QueryTimeoutError(DatabaseError):
     """The statement ran longer than the configured query timeout."""
 
@@ -80,7 +90,7 @@ class QueryTimeoutError(DatabaseError):
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class QueryExecutionError(DatabaseError):
     """The server executed the statement and SQL Server rejected it."""
 
@@ -93,7 +103,7 @@ class QueryExecutionError(DatabaseError):
         return f"SQL error{state} on {self.source_id!r}: {self.detail}"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class ReadOnlyViolationError(DatabaseError):
     """A write statement was rejected because the source is configured read-only."""
 

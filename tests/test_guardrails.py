@@ -175,3 +175,52 @@ class TestRowLimiting:
         result = apply_row_limit(sql, self._guardrail(100))
         # Should still have TOP since the actual SQL starts with SELECT
         assert "TOP 100" in result or "SELECT" in result
+
+
+# ---------------------------------------------------------------------------
+# Pagination — OFFSET/FETCH must never receive a TOP
+# ---------------------------------------------------------------------------
+
+
+class TestPaginatedQueries:
+    """A statement that paginates already limits itself, and SQL Server refuses
+    to see TOP beside OFFSET: "A TOP can not be used in the same query or
+    sub-query as a OFFSET" (Msg 10741).
+
+    Regression: the injection turned correct pagination into invalid SQL. The
+    failure then reached the caller as
+    `super(type, obj): obj must be an instance or subtype of type`, because the
+    typed error raised for it could not carry its own traceback — see
+    tests/test_errors.py. Callers had to rewrite valid SQL to TOP to work.
+    """
+
+    def _guardrail(self, max_rows: int = 1000) -> GuardrailConfig:
+        return GuardrailConfig(source="test", max_rows=max_rows)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT Name FROM Users ORDER BY Name OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY",
+            "select name from users order by name offset 0 rows fetch next 10 rows only",
+            "SELECT Name FROM Users ORDER BY Name OFFSET 20 ROWS",
+            "SELECT Name FROM Users ORDER BY Name OFFSET @skip ROWS FETCH NEXT @take ROWS ONLY",
+            "SELECT Name\nFROM Users\nORDER BY Name\nOFFSET 0 ROWS\nFETCH NEXT 5 ROWS ONLY",
+            "SELECT Name FROM Users ORDER BY Name OFFSET 1 ROW FETCH NEXT 1 ROW ONLY",
+        ],
+    )
+    def test_pagination_is_left_untouched(self, sql: str):
+        assert apply_row_limit(sql, self._guardrail(500)) == sql
+
+    def test_a_paginated_query_keeps_its_own_top_untouched(self):
+        # Already invalid SQL, but ours to report rather than to rewrite: the
+        # engine now says so in its own words.
+        sql = "SELECT TOP 5 Name FROM Users ORDER BY Name OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY"
+        assert apply_row_limit(sql, self._guardrail(500)) == sql
+
+    def test_the_word_offset_in_a_literal_does_not_block_injection(self):
+        sql = "SELECT Name FROM Users WHERE Note = 'offset 10 rows'"
+        assert "TOP 500" in apply_row_limit(sql, self._guardrail(500))
+
+    def test_an_unpaginated_select_still_gets_its_limit(self):
+        sql = "SELECT Name FROM Users ORDER BY Name"
+        assert "TOP 500" in apply_row_limit(sql, self._guardrail(500))
