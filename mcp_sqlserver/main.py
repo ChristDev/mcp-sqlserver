@@ -104,6 +104,7 @@ def main() -> None:
             transport="streamable-http",
             host=config.server.host,
             port=config.server.port,
+            stateless_http=config.server.stateless_http,
         )
 
 

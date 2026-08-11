@@ -60,6 +60,14 @@ class ServerConfig:
     port: int = 8002
     log_level: str = "INFO"
 
+    #: Serve HTTP without per-client MCP sessions. A session lives in one
+    #: process's memory, so the caller is bound to the replica that opened it:
+    #: any restart, scale event or load balancer without affinity answers
+    #: "Session not found". Self-contained requests remove that coupling, which
+    #: is what a server shared by many clients needs. Ignored over stdio, which
+    #: has exactly one client and no HTTP layer.
+    stateless_http: bool = True
+
 
 @dataclass
 class AppConfig:

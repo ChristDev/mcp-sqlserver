@@ -10,10 +10,12 @@ description = "Token-efficient MCP server for SQL Server — 1 tool + resources 
 requires-python = ">=3.11"
 readme = "README.md"
 license = {text = "MIT"}
-# Majors are pinned to what the concurrency work was validated against.
-# fastmcp 3.x moved lifespan handling; do not float across a major.
+# fastmcp is pinned exactly, not to a range. A range let every image resolve a
+# different patch at build time, so the same commit ran 3.4.0 in one container
+# and 3.4.7 in another — and a defect reproducible in one was invisible in the
+# other. Bump this deliberately, after testing, not as a side effect of a build.
 dependencies = [
-    "fastmcp>=3.2.0,<4",
+    "fastmcp==3.4.7",
     "pyodbc>=5.3.0,<6",
     "anyio>=4.13.0,<5",
 ]

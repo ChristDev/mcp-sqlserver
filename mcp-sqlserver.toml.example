@@ -64,3 +64,9 @@ host = "0.0.0.0"                 # Listen address (0.0.0.0 for Docker)
 port = 8002                      # Listen port for the MCP endpoint, NOT the
                                  # SQL Server port (that one lives in the dsn)
 log_level = "INFO"               # DEBUG, INFO, WARNING, ERROR
+stateless_http = true            # Serve HTTP without per-client MCP sessions.
+                                 # A session lives in one process's memory, so
+                                 # a restart, a scale event or a load balancer
+                                 # without affinity answers "Session not found".
+                                 # Leave true unless one client owns the server.
+                                 # Default: true. Ignored over stdio

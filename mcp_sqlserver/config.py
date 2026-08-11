@@ -71,6 +71,27 @@ def _positive_float(name: str, value: Any) -> float:
     return float(value)
 
 
+def _flag(name: str, value: Any) -> bool:
+    """Parse a config value that must be a true/false switch.
+
+    TOML has a real boolean type, so a quoted "true" is a typo worth naming
+    rather than silently accepting as truthy.
+    """
+    if not isinstance(value, bool):
+        raise InvalidConfigError(field=name, value=repr(value), expected="true or false")
+    return value
+
+
+def _env_flag(name: str, raw: str) -> bool:
+    """Read a true/false switch from the environment, where all values are text."""
+    normalised = raw.strip().lower()
+    if normalised in ("true", "1", "yes"):
+        return True
+    if normalised in ("false", "0", "no"):
+        return False
+    raise InvalidConfigError(field=name, value=repr(raw), expected="true or false")
+
+
 def _parse_source(raw: dict[str, Any]) -> SourceConfig:
     """Build one typed source, rejecting values the pool cannot honour."""
     source_id = str(raw["id"])
@@ -119,6 +140,7 @@ def _parse_toml(data: dict[str, Any]) -> AppConfig:
         host=server_data.get("host", "0.0.0.0"),
         port=server_data.get("port", 8002),
         log_level=server_data.get("log_level", "INFO"),
+        stateless_http=_flag("server.stateless_http", server_data.get("stateless_http", True)),
     )
 
     return AppConfig(sources=sources, guardrails=guardrails, server=server)
@@ -190,6 +212,10 @@ def _apply_server_env(server: ServerConfig) -> None:
     log_level = os.environ.get("MCP_SQLSERVER_LOG_LEVEL")
     if log_level:
         server.log_level = log_level
+
+    stateless_http = os.environ.get("MCP_SQLSERVER_STATELESS_HTTP")
+    if stateless_http:
+        server.stateless_http = _env_flag("MCP_SQLSERVER_STATELESS_HTTP", stateless_http)
 
 
 # ---------------------------------------------------------------------------

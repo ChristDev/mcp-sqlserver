@@ -44,6 +44,7 @@ class TestServerEnvOverrides:
             "MCP_SQLSERVER_HOST",
             "MCP_SQLSERVER_TRANSPORT_MODE",
             "MCP_SQLSERVER_LOG_LEVEL",
+            "MCP_SQLSERVER_STATELESS_HTTP",
             "MCP_SQLSERVER_DSN",
             "MCP_SQLSERVER_CONFIG",
         ):
@@ -76,6 +77,65 @@ class TestServerEnvOverrides:
         monkeypatch.setenv("MCP_SQLSERVER_PORT", "not-a-port")
         with pytest.raises(InvalidConfigError):
             load_config()
+
+
+class TestStatelessHttp:
+    """HTTP is served without per-client sessions unless asked otherwise.
+
+    A session lives in the memory of one process, which binds the caller to the
+    replica that opened it: a restart, a scale event or a load balancer without
+    affinity all answer "Session not found". Stateless is therefore the default,
+    and giving sessions back has to be a deliberate act.
+    """
+
+    BASE = (
+        '[[sources]]\nid = "x"\n'
+        'dsn = "Driver={ODBC Driver 18 for SQL Server};Server=h,1433;Database=D;UID=u;PWD=p"\n\n'
+    )
+
+    @pytest.fixture
+    def configure(self, tmp_path: Path, monkeypatch):
+        """Write a [server] block, load it, and hand back the parsed config."""
+
+        def write(server_block: str = "") -> AppConfig:
+            (tmp_path / "mcp-sqlserver.toml").write_text(
+                self.BASE + server_block, encoding="utf-8"
+            )
+            return load_config()
+
+        monkeypatch.chdir(tmp_path)
+        for var in (
+            "MCP_SQLSERVER_STATELESS_HTTP",
+            "MCP_SQLSERVER_DSN",
+            "MCP_SQLSERVER_CONFIG",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        return write
+
+    def test_defaults_to_stateless_when_the_toml_is_silent(self, configure):
+        assert configure("[server]\nport = 8002\n").server.stateless_http is True
+
+    def test_the_toml_can_ask_for_sessions_back(self, configure):
+        assert configure("[server]\nstateless_http = false\n").server.stateless_http is False
+
+    def test_env_applies_its_own_value_over_the_toml(self, configure, monkeypatch):
+        monkeypatch.setenv("MCP_SQLSERVER_STATELESS_HTTP", "false")
+        assert configure("[server]\nstateless_http = true\n").server.stateless_http is False
+
+    def test_env_accepts_the_usual_spellings_of_true(self, configure, monkeypatch):
+        monkeypatch.setenv("MCP_SQLSERVER_STATELESS_HTTP", "YES")
+        assert configure("[server]\nstateless_http = false\n").server.stateless_http is True
+
+    def test_a_quoted_toml_boolean_is_rejected(self, configure):
+        # "false" is a string, and a truthy one. Accepting it would do the exact
+        # opposite of what the file says, silently.
+        with pytest.raises(InvalidConfigError):
+            configure('[server]\nstateless_http = "false"\n')
+
+    def test_an_unparseable_env_value_is_rejected(self, configure, monkeypatch):
+        monkeypatch.setenv("MCP_SQLSERVER_STATELESS_HTTP", "maybe")
+        with pytest.raises(InvalidConfigError):
+            configure()
 
 
 class TestResolveTomlPath:
