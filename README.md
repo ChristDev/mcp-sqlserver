@@ -116,8 +116,13 @@ Add to your MCP client config:
 <details>
 <summary><b>OpenCode</b> — opencode.json</summary>
 
+Connects to an already-running server. OpenCode spawns nothing; it just opens the HTTP connection.
+
+Global file at `~/.config/opencode/opencode.json`, or local `opencode.json` inside the project — the local one wins.
+
 ```json
 {
+  "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "sqlserver": {
       "type": "remote",
@@ -127,6 +132,49 @@ Add to your MCP client config:
   }
 }
 ```
+
+Restart OpenCode after saving. To confirm it connected, ask it to read the `db://connections` resource: it should answer with the configured databases.
+</details>
+
+<details>
+<summary><b>Kiro</b> — .kiro/settings/mcp.json</summary>
+
+Kiro supports both modes. The recommended one connects to the container that is already up:
+
+```json
+{
+  "mcpServers": {
+    "sqlserver": {
+      "type": "remote",
+      "url": "http://localhost:8002/mcp",
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}
+```
+
+The second mode has Kiro spawn the server as a stdio subprocess. That requires the package installed locally (`pip install -e .`), and the configuration travels through environment variables, because the process inherits nothing from the container:
+
+```json
+{
+  "mcpServers": {
+    "sqlserver": {
+      "command": "mcp-sqlserver",
+      "args": ["--transport", "stdio"],
+      "env": {
+        "MCP_SQLSERVER_CONFIG": "C:/full/path/mcp-sqlserver.toml"
+      },
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}
+```
+
+The file goes in `.kiro/settings/mcp.json` for one project, or `~/.kiro/settings/mcp.json` for all of them. When both exist they are merged, and the project one takes precedence.
+
+On `autoApprove`: leaving it empty means every call is confirmed first. Adding `"execute_sql"` removes that prompt, which is only advisable when the source runs `readonly`, since that same tool also executes INSERT, UPDATE, DELETE and DDL.
 </details>
 
 <details>

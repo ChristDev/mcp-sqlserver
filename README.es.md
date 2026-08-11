@@ -114,8 +114,13 @@ Agrega esto a la config de tu cliente MCP:
 <details>
 <summary><b>OpenCode</b> — opencode.json</summary>
 
+Se conecta al servidor que ya está corriendo. OpenCode no lanza ningún proceso: solo abre la conexión HTTP.
+
+Archivo global en `~/.config/opencode/opencode.json`, o local en `opencode.json` dentro del proyecto (el local tiene prioridad).
+
 ```json
 {
+  "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "sqlserver": {
       "type": "remote",
@@ -125,6 +130,49 @@ Agrega esto a la config de tu cliente MCP:
   }
 }
 ```
+
+Después de guardar hay que reiniciar OpenCode. Para verificar que quedó conectado, se le puede pedir que lea el recurso `db://connections`: debe responder con la lista de bases configuradas.
+</details>
+
+<details>
+<summary><b>Kiro</b> — .kiro/settings/mcp.json</summary>
+
+Kiro admite las dos modalidades. La recomendada es conectarse al contenedor que ya está levantado:
+
+```json
+{
+  "mcpServers": {
+    "sqlserver": {
+      "type": "remote",
+      "url": "http://localhost:8002/mcp",
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}
+```
+
+La segunda modalidad es que Kiro lance el servidor como subproceso en modo stdio. En ese caso el paquete debe estar instalado localmente (`pip install -e .`) y la configuración viaja por variables de entorno, porque el proceso no hereda el TOML del contenedor:
+
+```json
+{
+  "mcpServers": {
+    "sqlserver": {
+      "command": "mcp-sqlserver",
+      "args": ["--transport", "stdio"],
+      "env": {
+        "MCP_SQLSERVER_CONFIG": "C:/ruta/completa/mcp-sqlserver.toml"
+      },
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}
+```
+
+El archivo puede ir en `.kiro/settings/mcp.json` dentro del proyecto, o en `~/.kiro/settings/mcp.json` para todos los proyectos. Si existen los dos, se combinan y el del proyecto tiene prioridad.
+
+Sobre `autoApprove`: dejarlo vacío obliga a confirmar cada llamada. Agregar `"execute_sql"` evita la confirmación, pero conviene hacerlo solo si la fuente está en modo `readonly`, porque esa herramienta también ejecuta INSERT, UPDATE, DELETE y DDL.
 </details>
 
 <details>
@@ -244,7 +292,7 @@ MCP_SQLSERVER_MAX_ROWS=1000
 MCP_SQLSERVER_QUERY_TIMEOUT=30
 ```
 
-**Los settings de pool son solo por TOML.** `pool_size`, `pool_timeout` y `connect_timeout` son por fuente y no tienen equivalente en variables de entorno — el camino por env es el arranque rápido de base única, donde el default del transporte ya es la respuesta correcta.
+**Los parámetros del pool se configuran únicamente en el TOML.** `pool_size`, `pool_timeout` y `connect_timeout` son por fuente y no tienen equivalente en variables de entorno: la vía por entorno está pensada para el arranque rápido de una sola base, donde el valor por defecto del transporte ya es el adecuado.
 
 ### Prioridad de config
 
@@ -279,7 +327,7 @@ Timeout de statement por fuente, en segundos, aplicado sobre la conexión ODBC. 
 
 ## Concurrencia
 
-Este server está pensado para ser compartido por varios usuarios y agentes. Cada fuente tiene un **pool de conexiones acotado**: se presta una conexión a una query completa y se devuelve al terminar, de modo que dos llamadores nunca tocan el mismo handle de pyodbc — algo que pyodbc (`threadsafety = 1`) no permite.
+Este servidor está pensado para ser compartido por varios usuarios y agentes. Cada fuente tiene un **pool de conexiones acotado**: se presta una conexión a una consulta completa y se devuelve al terminar, de modo que dos llamadores nunca usan el mismo handle de pyodbc — algo que pyodbc (`threadsafety = 1`) no permite.
 
 Se ajusta por bloque `[[sources]]` en `mcp-sqlserver.toml` — no hay otro lugar:
 
@@ -297,7 +345,7 @@ Database 'production' is busy: 4 queries are already running and no slot became
 available within 5s. Retry shortly or raise pool_size for this source.
 ```
 
-**Dimensionamiento**: `pool_size` × cantidad de fuentes es el techo de sesiones que este server abre contra SQL Server. Empezá en 4 por fuente y subilo solo si los usuarios efectivamente ven errores de "busy".
+**Dimensionamiento**: `pool_size` × cantidad de fuentes es el techo de sesiones que este servidor abre contra SQL Server. Conviene dejar el valor por defecto de 4 por fuente y aumentarlo únicamente si los usuarios llegan a ver errores de "busy".
 
 ## Health Check
 
