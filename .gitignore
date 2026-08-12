@@ -21,3 +21,6 @@ mcp-sqlserver.toml
 
 .vscode/
 .idea/
+
+.omo/
+.sisyphus/
